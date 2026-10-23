@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +51,7 @@ func holding(credits ...usage.ResetCredit) *usage.Usage {
 }
 
 func TestRunRedeemRefusesToWasteAResetOnBarelyUsedWindows(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	card := usage.ResetCredit{Status: "available", ID: "g", Clears: []string{usage.ClearsFiveHour, usage.ClearsWeekly}}
 	u := holding(card)
 	u.FiveHour.UsedPercent, u.Weekly.UsedPercent = 22, 4
@@ -81,6 +84,7 @@ func TestRunRedeemRefusesToWasteAResetOnBarelyUsedWindows(t *testing.T) {
 }
 
 func TestRunRedeemJudgesOnlyTheWindowsTheResetRestores(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	// Weekly is nearly spent, but this card only restores the 5h window.
 	card := usage.ResetCredit{Status: "available", ID: "g", Clears: []string{usage.ClearsFiveHour}}
 	u := holding(card)
@@ -94,6 +98,7 @@ func TestRunRedeemJudgesOnlyTheWindowsTheResetRestores(t *testing.T) {
 }
 
 func TestRunRedeemSpendsTheCardItShowed(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	card := usage.ResetCredit{Status: "available", ID: "opus55-launch", Label: "Opus 5.5 launch", ExpiresAt: time.Now().Add(48 * time.Hour)}
 	claude := &fakeRedeemer{name: "claude", u: holding(card), outcome: provider.RedeemReset}
 	codex := &fakeRedeemer{name: "codex", u: holding()}
@@ -105,6 +110,10 @@ func TestRunRedeemSpendsTheCardItShowed(t *testing.T) {
 	if len(claude.spent) != 1 || claude.spent[0].ID != "opus55-launch" {
 		t.Fatalf("spent = %+v, want the card that was shown", claude.spent)
 	}
+	// A running watch waiting out the window the card just ended is told so.
+	if _, err := os.Stat(filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "limitping", "nudge", "claude")); err != nil {
+		t.Fatalf("redeem did not nudge the watch: %v", err)
+	}
 	got := out.String()
 	for _, want := range []string{"claude  redeeming 1 reset credit — Opus 5.5 launch (expires", "claude  redeemed"} {
 		if !strings.Contains(got, want) {
@@ -114,6 +123,7 @@ func TestRunRedeemSpendsTheCardItShowed(t *testing.T) {
 }
 
 func TestRunRedeemAsksWhichProviderWhenBothHoldResets(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	claude := &fakeRedeemer{name: "claude", u: holding(usage.ResetCredit{Status: "available", ID: "g"})}
 	codex := &fakeRedeemer{name: "codex", u: holding(usage.ResetCredit{Status: "available", ExpiresAt: time.Now().Add(time.Hour)})}
 	ps := []provider.Provider{claude, codex}
@@ -137,6 +147,7 @@ func TestRunRedeemAsksWhichProviderWhenBothHoldResets(t *testing.T) {
 }
 
 func TestRunRedeemSurvivesOneProviderFailingToRead(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	claude := &fakeRedeemer{name: "claude", readErr: errors.New("not logged in")}
 	codex := &fakeRedeemer{name: "codex", u: holding(usage.ResetCredit{Status: "available", ExpiresAt: time.Now().Add(time.Hour)}), outcome: provider.RedeemReset}
 	if err := runRedeem(context.Background(), &bytes.Buffer{}, enText, []provider.Provider{claude, codex}, false, false); err != nil {
@@ -157,6 +168,7 @@ func TestRunRedeemSurvivesOneProviderFailingToRead(t *testing.T) {
 // "No reset credits available" is only true when the provider read them and
 // holds none; every other reason for having nothing to spend is said as such.
 func TestRunRedeemSaysWhyNothingCanBeSpent(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	cases := []struct {
 		name string
 		u    *usage.Usage
@@ -196,6 +208,7 @@ func TestRunRedeemSaysWhyNothingCanBeSpent(t *testing.T) {
 }
 
 func TestRunRedeemExplainsAnIneligibleCard(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // redeem nudges watch through the config dir
 	claude := &fakeRedeemer{name: "claude", u: holding(usage.ResetCredit{Status: "available", ID: "g"}),
 		outcome: provider.RedeemIneligible, reason: "surface"}
 	var out bytes.Buffer

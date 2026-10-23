@@ -513,7 +513,10 @@ continue_prompt  = "continue"  # message `continue` injects on 5h recovery; empt
 Top-level keys:
 
 - **`weekly_threshold`** — when the weekly window is at/above this, `watch` stops
-  pinging and waits for the weekly reset (unless usable credits exist).
+  pinging and waits for the weekly reset (unless usable credits exist). It
+  re-reads usage every 30 minutes while waiting, so a reset card redeemed in
+  the meantime resumes pinging; one redeemed with `limitping redeem` wakes it
+  within a minute.
 - **`reset_buffer`** — how long to wait after a window's reset time before
   pinging, so the window has definitely rolled over.
 - **`usage_display`** — whether text `status` / `bg status` renders each window

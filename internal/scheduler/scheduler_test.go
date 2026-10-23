@@ -1,9 +1,11 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -327,6 +329,126 @@ func TestRunTargetWeeklyExhaustedSleepsUntilReset(t *testing.T) {
 	if reads != 1 || triggers != 0 {
 		t.Fatalf("exhausted weekly should sleep without pinging; reads=%d triggers=%d", reads, triggers)
 	}
+}
+
+// A weekly window reset before its published reset — a redeemed reset card —
+// is seen on the next recheck rather than days later, and the long wait is
+// announced once, not on every recheck.
+func TestRunTargetNoticesWeeklyResetEarly(t *testing.T) {
+	defer func(d time.Duration) { stateRecheck = d }(stateRecheck)
+	stateRecheck = 10 * time.Millisecond
+
+	p := &stubProvider{
+		usage: &usage.Usage{
+			FiveHour: usage.Window{WindowSeconds: 18000},
+			Weekly: usage.Window{
+				UsedPercent:   99,
+				ResetsAt:      time.Now().Add(69 * time.Hour),
+				WindowSeconds: 604800,
+			},
+		},
+	}
+	var log syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(testConfig(), []Target{{Provider: p}}, false, false, &log)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runTarget(ctx, Target{Provider: p})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor(t, time.Second, func() bool {
+		reads, _ := p.counts()
+		return reads >= 3
+	})
+	if _, triggers := p.counts(); triggers != 0 {
+		t.Fatalf("exhausted weekly must not ping; triggers=%d", triggers)
+	}
+	if n := strings.Count(log.String(), "weekly limit exhausted"); n != 1 {
+		t.Fatalf("log = %q, want the exhausted wait announced once, got %d", log.String(), n)
+	}
+
+	p.mu.Lock()
+	p.usage = &usage.Usage{FiveHour: usage.Window{WindowSeconds: 18000}, Weekly: usage.Window{WindowSeconds: 604800}}
+	p.mu.Unlock()
+	waitFor(t, time.Second, func() bool {
+		_, triggers := p.counts()
+		return triggers == 1
+	})
+	if !strings.Contains(log.String(), "weekly limit no longer exhausted (0%) before its reset") {
+		t.Fatalf("log = %q, want the early reset noted", log.String())
+	}
+}
+
+// `limitping redeem` spending a card mid-wait wakes the loop well before its
+// recheck, so the window the card freed is pinged now.
+func TestRunTargetWakesWhenRedeemNudges(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	defer func(recheck, nap time.Duration) { stateRecheck, wallClockNap = recheck, nap }(stateRecheck, wallClockNap)
+	stateRecheck, wallClockNap = time.Hour, 5*time.Millisecond
+
+	p := &stubProvider{
+		usage: &usage.Usage{
+			FiveHour: usage.Window{WindowSeconds: 18000},
+			Weekly: usage.Window{
+				UsedPercent:   100,
+				ResetsAt:      time.Now().Add(69 * time.Hour),
+				WindowSeconds: 604800,
+			},
+		},
+	}
+	stop := runStub(t, Target{Provider: p})
+	defer stop()
+
+	if reads, triggers := settleAndCount(t, p); reads != 1 || triggers != 0 {
+		t.Fatalf("exhausted weekly should wait; reads=%d triggers=%d", reads, triggers)
+	}
+	p.mu.Lock()
+	p.usage = &usage.Usage{FiveHour: usage.Window{WindowSeconds: 18000}, Weekly: usage.Window{WindowSeconds: 604800}}
+	p.mu.Unlock()
+	if err := Nudge(p.Name()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		_, triggers := p.counts()
+		return triggers == 1
+	})
+}
+
+func TestSleepCtxWaitsTheDuration(t *testing.T) {
+	start := time.Now()
+	if !sleepCtx(context.Background(), 20*time.Millisecond) {
+		t.Fatal("sleepCtx reported cancellation")
+	}
+	if got := time.Since(start); got < 20*time.Millisecond {
+		t.Fatalf("sleepCtx returned after %s, want at least 20ms", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepCtx(ctx, time.Hour) {
+		t.Fatal("sleepCtx ignored a cancelled context")
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestRunTargetCreditsBypassWeeklyLimit(t *testing.T) {

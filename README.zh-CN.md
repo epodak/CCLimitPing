@@ -465,7 +465,8 @@ continue_prompt  = "continue"  # continue 在 5h 恢复时注入的消息;留空
 顶层配置项:
 
 - **`weekly_threshold`** —— 周窗口到/超过此值时,`watch` 停止 ping 并等到周重置
-  (除非还有可用 credits)。
+  (除非还有可用 credits)。等待期间每 30 分钟重读一次用量,所以期间兑换了重置卡
+  也会恢复 ping;用 `limitping redeem` 兑换的话,1 分钟内就会唤醒 watch。
 - **`reset_buffer`** —— 在窗口重置时刻之后再等待多久才 ping,确保窗口确实已翻篇。
 - **`usage_display`** —— 文本 `status` / `bg status` 使用已用百分比还是剩余百分比。
 - **`align_start`**(每个 Provider)—— 固定窗口相位:设为一个未来的 RFC3339 时间,

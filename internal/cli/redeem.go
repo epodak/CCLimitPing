@@ -12,6 +12,7 @@ import (
 
 	"github.com/wavever/CCLimitPing/internal/config"
 	"github.com/wavever/CCLimitPing/internal/provider"
+	"github.com/wavever/CCLimitPing/internal/scheduler"
 	"github.com/wavever/CCLimitPing/internal/usage"
 )
 
@@ -131,6 +132,9 @@ func runRedeem(ctx context.Context, out io.Writer, text cliText, ps []provider.P
 	redeemCtx, cancel := context.WithTimeout(ctx, redeemTimeout)
 	defer cancel()
 	res, err := pl.p.RedeemResetCredit(redeemCtx, pl.credit)
+	// Even a failed request may have spent the card, and a needless nudge
+	// costs a running watch only one usage read.
+	_ = scheduler.Nudge(pl.p.Name())
 	if err != nil {
 		return err
 	}

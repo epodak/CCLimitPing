@@ -33,6 +33,20 @@ const (
 	readTimeout    = 30 * time.Second
 	triggerTimeout = 3 * time.Minute
 	activeTaskPoll = time.Minute
+	resetTolerance = time.Minute // reset times this close are the same reset, re-read
+)
+
+// Vars so tests can shorten them.
+var (
+	// stateRecheck caps how long the loop goes without reading usage while it
+	// waits out a window. A window can end before its published reset — a reset
+	// card redeemed outside limitping, a provider resetting everyone's limits —
+	// and only a fresh read sees that. `limitping redeem` does not wait for it:
+	// it nudges the loop (see Nudge).
+	stateRecheck = 30 * time.Minute
+	// wallClockNap is the longest stretch sleepCtx trusts the monotonic clock
+	// for, and so how quickly a waiting loop notices a nudge.
+	wallClockNap = time.Minute
 )
 
 // Target pairs a provider with its scheduling options.
@@ -108,6 +122,17 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 	aligned := t.AlignStart.IsZero() // whether the align gate has been passed
 	var lastPingAt time.Time
 	pingConfirms := 0 // re-reads spent waiting for the last ping's window to show up
+	// The reset the loop last announced waiting for, so the re-reads during
+	// one long wait log (and notify) it once; zero when not waiting on one.
+	var waitKind string
+	var waitReset time.Time
+	announce := func(kind string, resetsAt time.Time) bool {
+		if kind == waitKind && sameReset(resetsAt, waitReset) {
+			return false
+		}
+		waitKind, waitReset = kind, resetsAt
+		return true
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -116,6 +141,7 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 
 		s.live.set(name, "checking usage…", time.Time{})
 		rctx, cancel := context.WithTimeout(ctx, readTimeout)
+		readAt := time.Now()
 		u, err := provider.ReadUsageForLoop(rctx, t.Provider, s.autoRedeems(t))
 		cancel()
 		if err != nil {
@@ -148,16 +174,23 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 
 		// Respect the weekly limit: if exhausted (and no usable credits), wait
 		// for the weekly window to reset instead of pinging.
-		if s.weeklyExhausted(u) {
+		exhausted := s.weeklyExhausted(u)
+		if waitKind == waitWeeklyExhausted && !exhausted && time.Now().Before(waitReset.Add(-resetTolerance)) {
+			s.log.Printf("[%s] weekly limit no longer exhausted (%.0f%%) before its reset; resuming pings",
+				name, u.Weekly.UsedPercent)
+		}
+		if exhausted {
 			wait := u.Weekly.Remaining() + s.cfg.ResetBuffer.Duration
 			if wait <= 0 {
 				wait = time.Minute
 			}
-			s.log.Printf("[%s] weekly limit exhausted (%.0f%%); sleeping %s until weekly reset",
-				name, u.Weekly.UsedPercent, wait.Round(time.Second))
+			if announce(waitWeeklyExhausted, u.Weekly.ResetsAt) {
+				s.log.Printf("[%s] weekly limit exhausted (%.0f%%); sleeping %s until weekly reset",
+					name, u.Weekly.UsedPercent, wait.Round(time.Second))
+				s.notify(name+": weekly limit reached", "Skipping pings until weekly reset")
+			}
 			s.live.set(name, fmt.Sprintf("weekly limit reached (%.0f%%)", u.Weekly.UsedPercent), time.Now().Add(wait))
-			s.notify(name+": weekly limit reached", "Skipping pings until weekly reset")
-			if !sleepCtx(ctx, wait) {
+			if !waitWindow(ctx, name, readAt, min(wait, stateRecheck)) {
 				return
 			}
 			continue
@@ -170,11 +203,13 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 		// its reset — pinging every 5h would just burn weekly quota.
 		if u.FiveHour.Missing() && u.Weekly.Active() {
 			wait := u.Weekly.Remaining() + s.cfg.ResetBuffer.Duration
-			s.log.Printf("[%s] no 5h window (weekly-only limits, %.0f%%); next ping at weekly reset %s (in %s)",
-				name, u.Weekly.UsedPercent,
-				u.Weekly.ResetsAt.Local().Format("15:04:05"), wait.Round(time.Second))
+			if announce(waitWeeklyOnly, u.Weekly.ResetsAt) {
+				s.log.Printf("[%s] no 5h window (weekly-only limits, %.0f%%); next ping at weekly reset %s (in %s)",
+					name, u.Weekly.UsedPercent,
+					u.Weekly.ResetsAt.Local().Format("15:04:05"), wait.Round(time.Second))
+			}
 			s.live.set(name, fmt.Sprintf("weekly-only %.0f%% — ping at weekly reset", u.Weekly.UsedPercent), time.Now().Add(wait))
-			if !sleepCtx(ctx, wait) {
+			if !waitWindow(ctx, name, readAt, min(wait, stateRecheck)) {
 				return
 			}
 			continue
@@ -185,15 +220,18 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 			// Started, whoever started it: the next free window starts afresh.
 			retry = pingRetry{}
 			wait := u.FiveHour.Remaining() + s.cfg.ResetBuffer.Duration
-			s.log.Printf("[%s] 5h window active (%.0f%%), next ping at %s (in %s)",
-				name, u.FiveHour.UsedPercent,
-				u.FiveHour.ResetsAt.Local().Format("15:04:05"), wait.Round(time.Second))
+			if announce(waitFiveHour, u.FiveHour.ResetsAt) {
+				s.log.Printf("[%s] 5h window active (%.0f%%), next ping at %s (in %s)",
+					name, u.FiveHour.UsedPercent,
+					u.FiveHour.ResetsAt.Local().Format("15:04:05"), wait.Round(time.Second))
+			}
 			s.live.set(name, fmt.Sprintf("5h window %.0f%% — next ping", u.FiveHour.UsedPercent), time.Now().Add(wait))
-			if !sleepCtx(ctx, wait) {
+			if !waitWindow(ctx, name, readAt, min(wait, stateRecheck)) {
 				return
 			}
 			continue
 		}
+		waitKind, waitReset = "", time.Time{}
 
 		// Window is free. Guard against double-pinging if our last ping isn't
 		// reflected by the endpoint yet. Estimating the cycle from our own ping
@@ -440,17 +478,59 @@ func usageRateLimitWait(retryAfter time.Time, now time.Time) time.Duration {
 	return rateLimitPause
 }
 
-// sleepCtx sleeps for d and reports false if the context was cancelled.
+// The long waits runTarget announces, for logging each one once.
+const (
+	waitWeeklyExhausted = "weekly-exhausted"
+	waitWeeklyOnly      = "weekly-only"
+	waitFiveHour        = "5h"
+)
+
+// sameReset reports whether two published reset times name the same reset;
+// re-reads of one window can differ by a second or so.
+func sameReset(a, b time.Time) bool {
+	d := a.Sub(b)
+	return d > -resetTolerance && d < resetTolerance
+}
+
+// Sleep is sleepCtx for the other long-waiting loops (`limitping schedule`).
+func Sleep(ctx context.Context, d time.Duration) bool {
+	return sleepCtx(ctx, d)
+}
+
+// sleepCtx sleeps for d of wall-clock time and reports false if the context was
+// cancelled. Go timers run on the monotonic clock, which on macOS stops while
+// the machine sleeps, so one long timer fires late by however long the lid was
+// shut. Napping in short stretches against a wall-clock deadline (Round(0)
+// drops the monotonic reading) wakes on time instead.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
+	return sleepOrWake(ctx, d, nil)
+}
+
+// waitWindow is sleepCtx for waiting out one of name's windows, cut short when
+// `limitping redeem` nudges name after readAt, the read the wait is based on:
+// the card it spent may have ended the window.
+func waitWindow(ctx context.Context, name string, readAt time.Time, d time.Duration) bool {
+	return sleepOrWake(ctx, d, func() bool { return nudgedSince(name, readAt) })
+}
+
+// sleepOrWake is sleepCtx that also ends early, between naps, once woken
+// reports true.
+func sleepOrWake(ctx context.Context, d time.Duration, woken func() bool) bool {
 	if d <= 0 {
 		return true
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
+	deadline := time.Now().Round(0).Add(d)
+	for {
+		left := deadline.Sub(time.Now().Round(0))
+		if left <= 0 || (woken != nil && woken()) {
+			return true
+		}
+		t := time.NewTimer(min(left, wallClockNap))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
+		}
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/wavever/CCLimitPing/internal/config"
 	"github.com/wavever/CCLimitPing/internal/provider"
+	"github.com/wavever/CCLimitPing/internal/scheduler"
 )
 
 type scheduleSpec struct {
@@ -153,7 +154,7 @@ func runSchedule(ctx context.Context, out io.Writer, text cliText, providers []p
 			wait = 0
 		}
 		fmt.Fprintf(out, text.scheduleNextFmt, next.Local().Format("2006-01-02 15:04:05"), fmtDur(text, wait))
-		if !sleepSchedule(ctx, wait) {
+		if !scheduler.Sleep(ctx, wait) {
 			return nil
 		}
 		fmt.Fprintf(out, text.scheduleRunFmt, time.Now().Local().Format("2006-01-02 15:04:05"))
@@ -189,15 +190,4 @@ func (t dailyTime) String() string {
 		return fmt.Sprintf("%02d:%02d:%02d", t.Hour, t.Minute, t.Second)
 	}
 	return fmt.Sprintf("%02d:%02d", t.Hour, t.Minute)
-}
-
-func sleepSchedule(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
