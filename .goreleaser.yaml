@@ -78,7 +78,7 @@ homebrew_casks:
     # Unsigned binary: strip the macOS quarantine flag on install so it runs.
     hooks:
       post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/limitping"]
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/limitping"]
           end
