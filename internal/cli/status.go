@@ -479,7 +479,9 @@ func printResetCredits(out io.Writer, text cliText, rc *usage.ResetCredits) {
 		fmt.Fprintf(out, text.statusResetCreditsUnavailableFmt, resetCardsUnavailableText(text, rc.UnavailableReason))
 		return
 	}
-	if rc == nil || (rc.AvailableCount == 0 && len(rc.Credits) == 0) {
+	// With none left to redeem, the redeemed and expired cards are history that
+	// only crowds the block; `status --json` still carries them.
+	if rc == nil || rc.AvailableCount == 0 {
 		return
 	}
 	countFmt := text.statusResetCreditsManyFmt

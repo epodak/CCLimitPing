@@ -274,6 +274,26 @@ func TestPrintUsageIncludesResetCredits(t *testing.T) {
 	}
 }
 
+// With no card left to redeem, the spent ones are not worth a status line.
+func TestPrintUsageOmitsResetCreditsWhenNoneAvailable(t *testing.T) {
+	u := &usage.Usage{
+		Provider: "claude",
+		ResetCredits: &usage.ResetCredits{
+			Credits: []usage.ResetCredit{
+				{Status: "redeemed", Label: "Opus 5.5 launch", RedeemedAt: time.Now().Add(-time.Hour)},
+				{Status: "expired", Label: "Loyalty", ExpiresAt: time.Now().Add(-time.Hour)},
+			},
+		},
+	}
+	for name, text := range map[string]cliText{"en": enText, "zh": zhText} {
+		var out bytes.Buffer
+		printUsage(&out, text, u, false, "used", nil)
+		if got := out.String(); strings.Contains(got, "reset credits") || strings.Contains(got, "重置券") || strings.Contains(got, "Opus 5.5 launch") {
+			t.Fatalf("%s status output = %q, want no reset-credit block", name, got)
+		}
+	}
+}
+
 // Reset cards the server withholds are said to be withheld, rather than the
 // card line silently missing.
 func TestPrintUsageSaysWhyResetCardsAreWithheld(t *testing.T) {
