@@ -23,7 +23,6 @@ import (
 )
 
 const (
-	postPingGrace  = 15 * time.Second // wait after a ping before re-reading usage
 	pingConfirm    = 20 * time.Second // wait between re-reads while confirming a ping's window
 	pingConfirmMax = 4                // re-reads before falling back to an estimated window
 	minBackoff     = 30 * time.Second
@@ -38,6 +37,7 @@ const (
 
 // Vars so tests can shorten them.
 var (
+	postPingGrace = 15 * time.Second // wait after a ping before re-reading usage
 	// stateRecheck caps how long the loop goes without reading usage while it
 	// waits out a window. A window can end before its published reset — a reset
 	// card redeemed outside limitping, a provider resetting everyone's limits —
@@ -202,6 +202,7 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 		// useful ping is the one that anchors the weekly window right after
 		// its reset — pinging every 5h would just burn weekly quota.
 		if u.FiveHour.Missing() && u.Weekly.Active() {
+			lastPingAt, pingConfirms = time.Time{}, 0
 			wait := u.Weekly.Remaining() + s.cfg.ResetBuffer.Duration
 			if announce(waitWeeklyOnly, u.Weekly.ResetsAt) {
 				s.log.Printf("[%s] no 5h window (weekly-only limits, %.0f%%); next ping at weekly reset %s (in %s)",
@@ -219,6 +220,7 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 		if u.FiveHour.Active() {
 			// Started, whoever started it: the next free window starts afresh.
 			retry = pingRetry{}
+			lastPingAt, pingConfirms = time.Time{}, 0
 			wait := u.FiveHour.Remaining() + s.cfg.ResetBuffer.Duration
 			if announce(waitFiveHour, u.FiveHour.ResetsAt) {
 				s.log.Printf("[%s] 5h window active (%.0f%%), next ping at %s (in %s)",
@@ -257,8 +259,12 @@ func (s *Scheduler) runTarget(ctx context.Context, t Target) {
 				if !sleepCtx(ctx, wait) {
 					return
 				}
+				if !confirming {
+					lastPingAt, pingConfirms = time.Time{}, 0
+				}
 				continue
 			}
+			lastPingAt, pingConfirms = time.Time{}, 0
 		}
 
 		// Honor the first-window alignment anchor, once.

@@ -384,6 +384,78 @@ func TestRunTargetNoticesWeeklyResetEarly(t *testing.T) {
 	}
 }
 
+// A 5h window reset before its published reset — a global reset by the provider
+// (such as an out-of-band reset by staff) or a window reset out-of-band — must
+// be pinged immediately once observed, rather than mistaking it for a ping that
+// has not yet become visible.
+func TestRunTargetNoticesFiveHourResetEarly(t *testing.T) {
+	defer func(d time.Duration) { stateRecheck = d }(stateRecheck)
+	defer func(d time.Duration) { postPingGrace = d }(postPingGrace)
+	stateRecheck = 10 * time.Millisecond
+	postPingGrace = 10 * time.Millisecond
+
+	p := &stubProvider{
+		usage: &usage.Usage{
+			FiveHour: usage.Window{WindowSeconds: 18000},
+		},
+	}
+	var log syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(testConfig(), []Target{{Provider: p}}, false, false, &log)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runTarget(ctx, Target{Provider: p})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// 1. Initial free window triggers the first ping.
+	waitFor(t, time.Second, func() bool {
+		_, triggers := p.counts()
+		return triggers == 1
+	})
+
+	// 2. Next usage read reflects an active 5h window.
+	p.mu.Lock()
+	p.usage = &usage.Usage{
+		FiveHour: usage.Window{
+			UsedPercent:   5,
+			ResetsAt:      time.Now().Add(5 * time.Hour),
+			WindowSeconds: 18000,
+		},
+	}
+	p.mu.Unlock()
+
+	waitFor(t, time.Second, func() bool {
+		return strings.Contains(log.String(), "5h window active")
+	})
+
+	// 3. Provider triggers an out-of-band reset before the 5h window expires:
+	// window is now free again (used 0%, no active ResetsAt).
+	p.mu.Lock()
+	p.usage = &usage.Usage{
+		FiveHour: usage.Window{
+			UsedPercent:   0,
+			WindowSeconds: 18000,
+		},
+	}
+	p.mu.Unlock()
+
+	// 4. On recheck, the loop must immediately fire the next ping instead of
+	// logging "ping not visible in usage yet" and estimating the remainder.
+	waitFor(t, time.Second, func() bool {
+		_, triggers := p.counts()
+		return triggers == 2
+	})
+
+	if strings.Contains(log.String(), "ping not visible in usage yet") {
+		t.Fatalf("unexpected visibility retry logged for early reset: %s", log.String())
+	}
+}
+
 // `limitping redeem` spending a card mid-wait wakes the loop well before its
 // recheck, so the window the card freed is pinged now.
 func TestRunTargetWakesWhenRedeemNudges(t *testing.T) {
